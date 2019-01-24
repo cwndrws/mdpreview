@@ -1,0 +1,8 @@
+[package]
+name = "mdpreview"
+version = "0.1.0"
+authors = ["Charlie Andrews <charlie@cloudflare.com>"]
+
+[dependencies]
+pulldown-cmark = { version = "0.0.11", default-features = false }
+open = "1"
