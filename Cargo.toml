@@ -1,8 +1,14 @@
 [package]
 name = "mdpreview"
 version = "0.1.0"
-authors = ["Charlie Andrews <charlie@cloudflare.com>"]
+authors = ["Charlie Andrews <charlie@cwndr.ws>"]
+description = "A simple markdown preview tool"
+repository = "https://github.com/cwndrws/mdpreview"
+keywords = ["markdown"]
+license = "MIT"
 
 [dependencies]
 pulldown-cmark = { version = "0.0.11", default-features = false }
 open = "1"
+
+
