@@ -8,7 +8,8 @@ keywords = ["markdown"]
 license = "MIT"
 
 [dependencies]
-pulldown-cmark = { version = "0.0.11", default-features = false }
+pulldown-cmark = { version = "0.2.0", default-features = false }
 open = "1"
+notify = "4.0.0"
 
 

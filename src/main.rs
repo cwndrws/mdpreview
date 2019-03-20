@@ -4,7 +4,12 @@ use std::io;
 use std::io::prelude::*;
 use std::path::Path;
 use std::process;
+use std::sync::mpsc::channel;
+use std::time::Duration;
 
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+
+extern crate notify;
 extern crate open;
 extern crate pulldown_cmark;
 
@@ -16,8 +21,33 @@ fn main() {
     }
     let md_filename = &args[1];
     let html_filename = format!("{}.html", md_filename);
-    render_to_html(md_filename, &html_filename).unwrap();
-    open::that(html_filename).expect("Failed to open temp html file");
+    render_on_watch(md_filename, &html_filename).expect("Error rendering on watch");
+}
+
+fn render_on_watch<'a, P: AsRef<Path> + AsRef<std::ffi::OsStr>>(
+    md: &P,
+    html: &P,
+) -> notify::Result<()> {
+    // Render and open once for the first pass
+    render_and_open(md, html).expect("Error rendering file");
+    let (tx, rx) = channel();
+    let mut watcher: RecommendedWatcher = Watcher::new(tx, Duration::from_secs(2))?;
+    watcher.watch(md, RecursiveMode::Recursive)?;
+    loop {
+        match rx.recv() {
+            Ok(_event) => render_and_open(md, html).expect("Error rendering file"),
+            Err(e) => println!("Error: {:?}", e),
+        }
+    }
+}
+
+fn render_and_open<'a, P: AsRef<Path> + AsRef<std::ffi::OsStr>>(
+    md: &P,
+    html: &P,
+) -> Result<(), io::Error> {
+    render_to_html(md, html)?;
+    open::that(html).expect("Failed to open temp html file");
+    Ok(())
 }
 
 fn render_to_html<'a, P: AsRef<Path>>(md_filepath: P, html_filepath: P) -> Result<(), io::Error> {
