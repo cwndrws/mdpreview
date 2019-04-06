@@ -1,70 +1,194 @@
 use std::env;
 use std::fs::File;
-use std::io;
 use std::io::prelude::*;
-use std::path::Path;
 use std::process;
-use std::sync::mpsc::channel;
+use std::str;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
+use hyper::{Body, Request, Response};
+use hyper::rt::Future;
+use hyper::service::service_fn_ok;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use sha2::{Digest, Sha256};
 
+extern crate hyper;
 extern crate notify;
 extern crate open;
 extern crate pulldown_cmark;
-
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
+extern crate sha2;
+fn main() { let args: Vec<String> = env::args().collect(); if args.len() < 2 {
         println!("Must supply file name");
         process::exit(2);
     }
     let md_filename = &args[1];
-    let html_filename = format!("{}.html", md_filename);
-    render_on_watch(md_filename, &html_filename).expect("Error rendering on watch");
+
+    let (notify_tx, notify_rx): (Sender<String>, Receiver<String>) = channel();
+    let (render_tx, render_rx): (
+        Sender<Result<Rendered, String>>,
+        Receiver<Result<Rendered, String>>,
+    ) = channel();
+
+    let filewatcher = FileWatcher::new(md_filename.to_string(), notify_tx);
+    let _filewatcher_handle = thread::spawn(move || {
+        filewatcher.watch().expect("Failed to create file watcher");
+    });
+
+    let renderer = Renderer::new(notify_rx, render_tx);
+    let _renderer_handle = thread::spawn(move || {
+        renderer.render_on_recv();
+    });
+
+    let server = Server::new(md_filename.to_string());
+    server.serve(render_rx).expect("Server failed!");
 }
 
-fn render_on_watch<'a, P: AsRef<Path> + AsRef<std::ffi::OsStr>>(
-    md: &P,
-    html: &P,
-) -> notify::Result<()> {
-    // Render and open once for the first pass
-    render_and_open(md, html).expect("Error rendering file");
-    let (tx, rx) = channel();
-    let mut watcher: RecommendedWatcher = Watcher::new(tx, Duration::from_secs(2))?;
-    watcher.watch(md, RecursiveMode::Recursive)?;
-    loop {
-        match rx.recv() {
-            Ok(_event) => render_and_open(md, html).expect("Error rendering file"),
-            Err(e) => println!("Error: {:?}", e),
+struct FileWatcher {
+    filepath: String,
+    tx: Sender<String>,
+}
+
+impl FileWatcher {
+    fn new(filepath: String, tx: Sender<String>) -> FileWatcher {
+        FileWatcher { tx, filepath }
+    }
+
+    fn watch(&self) -> Result<(), String> {
+        let (notify_tx, notify_rx) = channel();
+        let mut watcher: RecommendedWatcher =
+            Watcher::new(notify_tx, Duration::from_secs(2)).map_err(|err| err.to_string())?;
+        watcher
+            .watch(&self.filepath, RecursiveMode::Recursive)
+            .map_err(|err| err.to_string())?;
+        loop {
+            match notify_rx.recv() {
+                Ok(_event) => self.tx.send(self.filepath.clone()).expect("couldn't write to watcher channel"),
+                Err(e) => println!("Error: {:?}", e),
+            };
         }
     }
 }
 
-fn render_and_open<'a, P: AsRef<Path> + AsRef<std::ffi::OsStr>>(
-    md: &P,
-    html: &P,
-) -> Result<(), io::Error> {
-    render_to_html(md, html)?;
-    open::that(html).expect("Failed to open temp html file");
-    Ok(())
+struct Renderer {
+    rx: Receiver<String>,
+    tx: Sender<Result<Rendered, String>>,
 }
 
-fn render_to_html<'a, P: AsRef<Path>>(md_filepath: P, html_filepath: P) -> Result<(), io::Error> {
-    let mut f = File::open(md_filepath).expect("Failed to open file");
+impl Renderer {
+    fn new(rx: Receiver<String>, tx: Sender<Result<Rendered, String>>) -> Renderer {
+        Renderer { rx: rx, tx: tx }
+    }
+
+    fn render_on_recv(&self) {
+        loop {
+            let res = match self.rx.recv() {
+                Ok(filepath) => render(filepath),
+                Err(e) => Err(format!("Error reading from channel: {:?}", e)),
+            };
+            self.tx.send(res).expect("couldn't write to render channel");
+        }
+    }
+}
+
+struct Rendered {
+    path: String,
+    contents: String,
+    hash: String,
+}
+
+fn render(filepath: String) -> Result<Rendered, String> {
+    let path = filepath.clone();
+    let mut f = File::open(filepath).map_err(|err| err.to_string())?;
     let mut file_contents = String::new();
-    f.read_to_string(&mut file_contents)?;
-    let html_output = md_to_html(file_contents);
-    let mut temp_html = File::create(html_filepath)?;
-    temp_html.write_all(html_output.as_bytes())?;
-    Ok(())
+    f.read_to_string(&mut file_contents)
+        .map_err(|err| err.to_string())?;
+    let parser = pulldown_cmark::Parser::new(file_contents.as_str());
+    let mut contents = String::new();
+    pulldown_cmark::html::push_html(&mut contents, parser);
+    let hash = generate_hash(contents.clone())?;
+    Ok(Rendered {
+        path: path,
+        contents: contents,
+        hash: hash,
+    })
 }
 
-fn md_to_html(md_text: String) -> String {
-    let parser = pulldown_cmark::Parser::new(md_text.as_str());
-    let mut html_buf = String::new();
-    pulldown_cmark::html::push_html(&mut html_buf, parser);
-    md_html_wrapper(html_buf)
+fn generate_hash(content: String) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    hasher.input(content);
+    let res = hasher.result();
+    str::from_utf8(&res[..])
+        .map(|s| s.to_string())
+        .map_err(|err| err.to_string())
+}
+
+struct Server {
+    rendered: Arc<Mutex<Result<Rendered, String>>>,
+}
+
+impl Server {
+    fn new(filepath: String) -> Server {
+        Server {
+            rendered: Arc::new(Mutex::new(render(filepath))),
+        }
+    }
+
+    fn serve(&self, rx: Receiver<Result<Rendered, String>>) -> Result<(), String> {
+        let rendered = Arc::clone(&self.rendered);
+        let _ = thread::spawn(move || {
+            loop {
+                match rx.recv() {
+                    Ok(s) => {
+                        let mut rendered = rendered.lock().unwrap();
+                        *rendered = s;
+                    },
+                    Err(e) => println!("Error receiving from channel: {:?}", e),
+                }
+            }
+        });
+
+        // actually serve the file
+        let addr = ([127, 0, 0, 1], 3000).into();
+        let handler = self.content_handler();
+        let new_svc = || {
+            service_fn_ok()
+        };
+
+        let srv = hyper::Server::bind(&addr)
+            .serve(new_svc)
+            .map_err(|e| eprintln!("server error: {}", e));
+
+        hyper::rt::run(srv);
+
+        Ok(())
+    }
+
+    fn content_handler(&self) -> impl FnMut(Request<Body>) -> Response<Body> {
+        let rendered = Arc::clone(&self.rendered);
+        |_req: Request<Body>| {
+            
+            let rendered = rendered.clone().lock().unwrap();
+
+            let resp_body = match *rendered {
+                Ok(r) => r.contents,
+                Err(e) => e,
+            };
+            Response::new(Body::from(resp_body))
+        }
+    }
+
+    fn hash_handler(&self, _req: Request<Body>) -> Response<Body> {
+        let rendered = self.rendered.lock().unwrap();
+
+        let resp_body = match *rendered {
+            Ok(r) => r.hash,
+            Err(e) => e,
+        };       
+
+        Response::new(Body::from(resp_body))
+    }
 }
 
 fn md_html_wrapper(content: String) -> String {
